@@ -1,0 +1,231 @@
+# Entrius 2025
+
+"""Axon handlers for miner PAT broadcasting and checking.
+
+Miners push their GitHub PAT to validators via PatBroadcastSynapse.
+Miners check if a validator has their PAT via PatCheckSynapse.
+"""
+
+import asyncio
+import json
+from typing import TYPE_CHECKING, Optional, Tuple
+
+import bittensor as bt
+import requests
+
+from gittensor.constants import (
+    BASE_GITHUB_API_URL,
+    GITHUB_HTTP_TIMEOUT_SECONDS,
+    GRAPHQL_VIEWER_QUERY,
+)
+from gittensor.synapses import PatBroadcastSynapse, PatCheckSynapse
+from gittensor.utils.github_api_tools import make_graphql_headers
+from gittensor.validator import pat_storage
+from gittensor.validator.utils.github_validation import (
+    validate_github_credentials,
+    validate_github_credentials_result,
+)
+
+if TYPE_CHECKING:
+    from neurons.validator import Validator
+
+
+def _get_hotkey(synapse: bt.Synapse) -> str:
+    """Extract the caller's hotkey from a synapse, raising if missing."""
+    assert synapse.dendrite is not None and synapse.dendrite.hotkey is not None
+    return synapse.dendrite.hotkey
+
+
+def _github_identity_pin_error(uid: int, hotkey: str, github_id: Optional[str]) -> Optional[str]:
+    existing = pat_storage.get_pat_by_uid(uid)
+    if existing and existing.get('hotkey') == hotkey and existing.get('github_id'):
+        if existing['github_id'] != github_id:
+            return 'GitHub identity is locked for this hotkey. Deregister and re-register to change GitHub accounts.'
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PatBroadcastSynapse handlers
+# ---------------------------------------------------------------------------
+
+
+async def handle_pat_broadcast(validator: 'Validator', synapse: PatBroadcastSynapse) -> PatBroadcastSynapse:
+    """Validate and store a miner's GitHub PAT."""
+    hotkey = _get_hotkey(synapse)
+
+    def _reject(reason: str) -> PatBroadcastSynapse:
+        synapse.accepted = False
+        synapse.rejection_reason = reason
+        synapse.github_access_token = ''
+        bt.logging.warning(f'PAT broadcast rejected — hotkey: {hotkey[:16]}... reason: {reason}')
+        return synapse
+
+    # 1. Verify hotkey is registered on the subnet
+    if hotkey not in validator.metagraph.hotkeys:
+        return _reject('Hotkey not registered on subnet')
+
+    uid = validator.metagraph.hotkeys.index(hotkey)
+
+    # 2. Validate PAT (checks it works, extracts github_id)
+    github_id, error = await asyncio.to_thread(validate_github_credentials, uid, synapse.github_access_token)
+    if error:
+        return _reject(error)
+
+    # Steps 3-5 read/write the PAT store. If it is momentarily unreadable, fail
+    # closed: reject so the miner retries, rather than letting save_pat overwrite
+    # (and wipe) the store or surfacing a raw axon error.
+    try:
+        # 3. Enforce GitHub identity pinning — same hotkey cannot switch GitHub accounts
+        identity_error = _github_identity_pin_error(uid, hotkey, github_id)
+        if identity_error:
+            return _reject(identity_error)
+
+        # 4. Test query against a known repo to catch org-restricted PATs
+        test_error = await asyncio.to_thread(_test_pat_against_repo, synapse.github_access_token)
+        if test_error:
+            return _reject(f'PAT test query failed: {test_error}')
+
+        identity_error = _github_identity_pin_error(uid, hotkey, github_id)
+        if identity_error:
+            return _reject(identity_error)
+
+        # 5. Store PAT (github_id guaranteed non-None after validate_github_credentials success)
+        pat_storage.save_pat(uid=uid, hotkey=hotkey, pat=synapse.github_access_token, github_id=github_id or '0')
+    except (json.JSONDecodeError, OSError) as e:
+        return _reject(f'Validator PAT store temporarily unavailable; please retry. ({e})')
+
+    # Clear PAT from response so it isn't echoed back
+    synapse.github_access_token = ''
+    synapse.accepted = True
+    bt.logging.success(f'PAT broadcast accepted — UID: {uid}, hotkey: {hotkey[:16]}..., github_id: {github_id}')
+    return synapse
+
+
+async def blacklist_pat_broadcast(validator: 'Validator', synapse: PatBroadcastSynapse) -> Tuple[bool, str]:
+    """Reject PAT broadcasts from unregistered hotkeys."""
+    hotkey = _get_hotkey(synapse)
+    if hotkey not in validator.metagraph.hotkeys:
+        return True, f'Hotkey {hotkey[:16]}... not registered'
+    return False, 'Hotkey recognized'
+
+
+async def priority_pat_broadcast(validator: 'Validator', synapse: PatBroadcastSynapse) -> float:
+    """Prioritize PAT broadcasts by stake."""
+    hotkey = _get_hotkey(synapse)
+    if hotkey not in validator.metagraph.hotkeys:
+        return 0.0
+    uid = validator.metagraph.hotkeys.index(hotkey)
+    return float(validator.metagraph.S[uid])
+
+
+# ---------------------------------------------------------------------------
+# PatCheckSynapse handlers
+# ---------------------------------------------------------------------------
+
+
+async def handle_pat_check(validator: 'Validator', synapse: PatCheckSynapse) -> PatCheckSynapse:
+    """Check if the validator has the miner's PAT stored and re-validate it."""
+    hotkey = _get_hotkey(synapse)
+    uid = validator.metagraph.hotkeys.index(hotkey)
+
+    bt.logging.info(f'PAT check request — UID: {uid}, hotkey: {hotkey[:16]}...')
+
+    # Reading the store can raise if it is momentarily unreadable. Mirror the
+    # broadcast handler and fail closed gracefully: report unknown + retry rather
+    # than throwing a raw axon error, and never claim "no PAT stored" (which would
+    # mislead the miner into re-broadcasting against an unreadable store).
+    try:
+        entry = pat_storage.get_pat_by_uid(uid)
+    except (json.JSONDecodeError, OSError) as e:
+        synapse.has_pat = False
+        synapse.pat_valid = None
+        synapse.rejection_reason = 'Validator PAT store temporarily unavailable; please retry.'
+        bt.logging.warning(f'PAT check result — UID: {uid}: store temporarily unreadable: {e}')
+        return synapse
+
+    # Check if PAT exists and hotkey matches (not a stale entry from a previous miner)
+    if entry is None or entry.get('hotkey') != hotkey:
+        synapse.has_pat = False
+        synapse.pat_valid = False
+        synapse.rejection_reason = 'No PAT stored for this miner'
+        bt.logging.info(f'PAT check result — UID: {uid}: no PAT stored')
+        return synapse
+
+    synapse.has_pat = True
+
+    # Re-validate the stored PAT
+    validation = await asyncio.to_thread(
+        validate_github_credentials_result,
+        uid,
+        entry['pat'],
+        stored_github_id=entry.get('github_id'),
+    )
+    if validation.transient_failure:
+        synapse.pat_valid = None
+        synapse.rejection_reason = 'GitHub API temporarily unavailable; retry the check in a few minutes.'
+        bt.logging.warning(f'PAT check result — UID: {uid}: GitHub identity lookup temporarily unavailable')
+        return synapse
+    if validation.error:
+        synapse.pat_valid = False
+        synapse.rejection_reason = validation.error
+        bt.logging.warning(f'PAT check result — UID: {uid}: validation failed: {validation.error}')
+        return synapse
+
+    test_error = await asyncio.to_thread(_test_pat_against_repo, entry['pat'])
+    if test_error:
+        synapse.pat_valid = False
+        synapse.rejection_reason = f'PAT test query failed: {test_error}'
+        bt.logging.warning(f'PAT check result — UID: {uid}: test query failed: {test_error}')
+        return synapse
+
+    synapse.pat_valid = True
+    bt.logging.success(f'PAT check result — UID: {uid}: valid')
+    return synapse
+
+
+async def blacklist_pat_check(validator: 'Validator', synapse: PatCheckSynapse) -> Tuple[bool, str]:
+    """Reject PAT checks from unregistered hotkeys."""
+    hotkey = _get_hotkey(synapse)
+    if hotkey not in validator.metagraph.hotkeys:
+        return True, f'Hotkey {hotkey[:16]}... not registered'
+    return False, 'Hotkey recognized'
+
+
+async def priority_pat_check(validator: 'Validator', synapse: PatCheckSynapse) -> float:
+    """Prioritize PAT checks by stake."""
+    hotkey = _get_hotkey(synapse)
+    if hotkey not in validator.metagraph.hotkeys:
+        return 0.0
+    uid = validator.metagraph.hotkeys.index(hotkey)
+    return float(validator.metagraph.S[uid])
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _test_pat_against_repo(pat: str) -> Optional[str]:
+    """Run a test GraphQL call to verify the PAT has the access scoring requires.
+
+    Scoring uses the GraphQL API to fetch miner PRs, so this mirrors the real path.
+    Returns an error string on failure, None on success.
+    """
+    try:
+        response = requests.post(
+            f'{BASE_GITHUB_API_URL}/graphql',
+            json={'query': GRAPHQL_VIEWER_QUERY},
+            headers=make_graphql_headers(pat),
+            timeout=GITHUB_HTTP_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            return f'GitHub GraphQL API returned {response.status_code}'
+        data = response.json()
+        errors = data.get('errors')
+        if errors:
+            return f'GraphQL error: {errors[0].get("message", "unknown")}'
+        if (data.get('data') or {}).get('viewer') is None:
+            return "Fine-grained PATs need 'Public Repositories (read-only)' permission"
+        return None
+    except requests.RequestException as e:
+        return str(e)

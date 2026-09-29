@@ -1,0 +1,23 @@
+# Emission-aware miner pipeline config
+# Copy to ~/.gittensor/miner_pipeline/config.yaml or ./miner_pipeline.yaml
+
+work_dir: ~/.gittensor/miner_pipeline
+github_pat_env: GITTENSOR_MINER_PAT
+
+# Safety defaults — keep dry_run true until you intentionally open PRs
+dry_run: true
+auto_pr: false
+auto_file_issues: false
+
+# Empty allowlist = all master repos
+repo_allowlist: []
+# Example:
+# repo_allowlist:
+#   - gittensor-ai-lab/sparkinfer
+#   - coderbench/bittrellis
+#   - gittensor-model-hub/spark-hermes
+
+# Keep this many open-PR slots free under the spam threshold
+max_open_prs_reserve: 1
+max_opportunities: 25
+clone_depth: 50

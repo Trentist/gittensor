@@ -1,0 +1,32 @@
+venv/
+gittensor-venv/
+.env
+*.env
+
+__pycache__
+.pytest_cache/
+
+*.egg-info
+
+# for vali testing
+wandb
+
+# for mergetool
+*.orig
+
+*.log
+
+# Validator data directory (contains sensitive miner PATs)
+data/
+
+CLAUDE.md
+.claude/
+.vscode/
+
+# Rust/Cargo build artifacts
+target/
+**/*.rs.bk
+*.lock
+!uv.lock
+
+**/.venv/

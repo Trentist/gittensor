@@ -1,0 +1,184 @@
+# The MIT License (MIT)
+# Copyright © 2023 Yuma Rao
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+import copy
+import os
+import time
+from abc import ABC, abstractmethod
+
+import bittensor as bt
+from bittensor.utils.btlogging import loggingmachine as bt_loggingmachine
+from websockets.exceptions import ConnectionClosedError
+
+from gittensor import __spec_version__ as spec_version
+
+# Sync calls set weights and also resyncs the metagraph.
+from gittensor.utils.config import add_args, check_config, config
+from gittensor.utils.misc import ttl_get_block
+
+
+class BaseNeuron(ABC):
+    """
+    Base class for Bittensor miners. This class is abstract and should be inherited by a subclass. It contains the core logic for all neurons; validators and miners.
+
+    In addition to creating a wallet, subtensor, and metagraph, this class also handles the synchronization of the network state via a basic checkpointing mechanism based on epoch length.
+    """
+
+    neuron_type: str = 'BaseNeuron'
+
+    @classmethod
+    def check_config(cls, config: 'bt.Config'):
+        check_config(cls, config)
+
+    @classmethod
+    def add_args(cls, parser):
+        add_args(cls, parser)
+
+    @classmethod
+    def config(cls):
+        return config(cls)
+
+    subtensor: 'bt.subtensor'
+    wallet: 'bt.wallet'
+    metagraph: 'bt.metagraph'
+    spec_version: int = spec_version
+
+    @property
+    def block(self):
+        return ttl_get_block(self)
+
+    def __init__(self, config=None):
+        base_config = copy.deepcopy(config or BaseNeuron.config())
+        self.config = self.config()
+        self.config.merge(base_config)
+        self.check_config(self.config)
+
+        # --logging.record_log keeps a rotating copy of the log next to state.npz (the compose mounts that dir), so
+        # both outlive the container; bittensor hard-codes 25 MB x 10, so size it first.
+        bt_loggingmachine.DEFAULT_MAX_ROTATING_LOG_FILE_SIZE = int(os.getenv('LOG_FILE_MAX_MB', '10')) * 1024 * 1024
+        bt_loggingmachine.DEFAULT_LOG_BACKUP_COUNT = int(os.getenv('LOG_FILE_BACKUPS', '4'))
+        bt.logging.set_config(config=self.config.logging)
+
+        # If a gpu is required, set the device to cuda:N (e.g. cuda:0)
+        self.device = self.config.neuron.device
+
+        # Log the configuration for reference.
+        # bt.logging.info(self.config)
+
+        # Build Bittensor objects
+        # These are core Bittensor classes to interact with the network.
+        bt.logging.info('Setting up bittensor objects.')
+
+        # The wallet holds the cryptographic key pairs for the miner.
+        self.wallet = bt.Wallet(config=self.config)
+        self.subtensor = bt.Subtensor(config=self.config)
+        self.metagraph = self.subtensor.metagraph(self.config.netuid)
+
+        bt.logging.info(f'Wallet: {self.wallet}')
+        bt.logging.info(f'Subtensor: {self.subtensor}')
+        bt.logging.info(f'Metagraph: {self.metagraph}')
+
+        # Check if the miner is registered on the Bittensor network before proceeding further.
+        self.check_registered()
+
+        # Each miner gets a unique identity (UID) in the network for differentiation.
+        self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+        bt.logging.info(
+            f'Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}'
+        )
+        self.step = 0
+
+    def _reconnect_subtensor(self):
+        """Recreate subtensor connection when WebSocket goes stale."""
+        bt.logging.info('Reconnecting subtensor...')
+        self.subtensor = bt.Subtensor(config=self.config)
+
+    @abstractmethod
+    async def forward(self, synapse: bt.Synapse) -> bt.Synapse: ...
+
+    @abstractmethod
+    def run(self): ...
+
+    def sync(self):
+        """
+        Wrapper for synchronizing the state of the network for the given miner or validator.
+        """
+        # Ensure miner or validator hotkey is still registered on the network.
+        self.check_registered()
+
+        if self.should_sync_metagraph():
+            self.resync_metagraph()
+
+        if self.should_set_weights():
+            self.set_weights()
+
+        # Always save state.
+        self.save_state()
+
+    def check_registered(self, max_retries: int = 3):
+        """Check if hotkey is registered, with retry logic for connection failures."""
+        for attempt in range(max_retries):
+            try:
+                if not self.subtensor.is_hotkey_registered(
+                    netuid=self.config.netuid,
+                    hotkey_ss58=self.wallet.hotkey.ss58_address,
+                ):
+                    bt.logging.error(
+                        f'Wallet: {self.wallet} is not registered on netuid {self.config.netuid}.'
+                        f' Please register the hotkey using `btcli subnets register` before trying again'
+                    )
+                    exit()
+                return  # Success
+            except ConnectionClosedError as e:
+                bt.logging.warning(
+                    f'WebSocket connection closed during check_registered (attempt {attempt + 1}/{max_retries}): {e}'
+                )
+                if attempt < max_retries - 1:
+                    self._reconnect_subtensor()
+                    time.sleep(2**attempt)  # Exponential backoff: 1s, 2s, 4s
+                else:
+                    raise
+
+    def should_sync_metagraph(self):
+        """
+        Check if enough epoch blocks have elapsed since the last checkpoint to sync.
+        """
+        return (self.block - self.metagraph.last_update[self.uid]) > self.config.neuron.epoch_length
+
+    def should_set_weights(self) -> bool:
+        # Don't set weights on initialization.
+        if self.step == 0:
+            return False
+
+        # Check if enough epoch blocks have elapsed since the last epoch.
+        if self.config.neuron.disable_set_weights:
+            return False
+
+        # Define appropriate logic for when set weights.
+        return (
+            self.block - self.metagraph.last_update[self.uid]
+        ) > self.config.neuron.epoch_length and self.neuron_type != 'MinerNeuron'  # don't set weights if you're a miner
+
+    def save_state(self):
+        bt.logging.trace(
+            'save_state() not implemented for this neuron. You can implement this function to save model checkpoints or other useful data.'
+        )
+
+    def load_state(self):
+        bt.logging.trace(
+            'load_state() not implemented for this neuron. You can implement this function to load model checkpoints or other useful data.'
+        )

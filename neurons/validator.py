@@ -1,0 +1,213 @@
+# The MIT License (MIT)
+# Copyright © 2025 Entrius
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+import os
+import time
+from functools import partial
+from typing import Dict, List, Set
+
+import bittensor as bt
+import wandb
+
+from gittensor import __version__
+from gittensor.classes import MinerEvaluation, MinerEvaluationCache
+from gittensor.validator import pat_storage
+from gittensor.validator.forward import forward
+from gittensor.validator.pat_handler import (
+    blacklist_pat_broadcast,
+    blacklist_pat_check,
+    handle_pat_broadcast,
+    handle_pat_check,
+    priority_pat_broadcast,
+    priority_pat_check,
+)
+from gittensor.validator.utils.config import (
+    STORE_DB_RESULTS,
+    WANDB_PROJECT,
+    WANDB_VALIDATOR_NAME,
+)
+from gittensor.validator.utils.load_weights import RepositoryConfig
+from gittensor.validator.utils.storage import DatabaseStorage
+from neurons.base.validator import BaseValidatorNeuron
+
+
+class Validator(BaseValidatorNeuron):
+    """
+    This class inherits from the BaseValidatorNeuron class, which in turn inherits from BaseNeuron.
+    The BaseNeuron class takes care of routine tasks such as setting up wallet, subtensor, metagraph, logging directory, parsing config, etc.
+    You can override any of the methods in BaseNeuron if you need to customize the behavior.
+    """
+
+    db_storage: DatabaseStorage = None
+    evaluation_cache: MinerEvaluationCache = None
+
+    def __init__(self, config=None):
+        super(Validator, self).__init__(config=config)
+
+        if os.environ.get('DEV_MODE'):
+            bt.logging.warning('⚠ DEV_MODE is active — maintainer PR filtering is bypassed')
+
+        # Ensure PAT storage file exists on boot
+        pat_storage.ensure_pats_file()
+
+        # Attach PAT broadcast and check handlers to the axon
+        if hasattr(self, 'axon') and self.axon is not None:
+            self.axon.attach(
+                forward_fn=partial(handle_pat_broadcast, self),
+                blacklist_fn=partial(blacklist_pat_broadcast, self),
+                priority_fn=partial(priority_pat_broadcast, self),
+            )
+            self.axon.attach(
+                forward_fn=partial(handle_pat_check, self),
+                blacklist_fn=partial(blacklist_pat_check, self),
+                priority_fn=partial(priority_pat_check, self),
+            )
+
+        # Init in-memory cache for miner evaluations (fallback when GitHub API fails)
+        self.evaluation_cache = MinerEvaluationCache()
+
+        # DB connection for validation result storage.
+        # Requires STORE_DB_RESULTS=true in .env
+        if STORE_DB_RESULTS:
+            bt.logging.warning('Validation result storage enabled.')
+            self.db_storage = DatabaseStorage()
+
+        # Initialize wandb only if disable_set_weights is False
+        if not self.config.neuron.disable_set_weights:
+            try:
+                wandb.init(
+                    entity='entrius-gittensor',
+                    project=WANDB_PROJECT,
+                    name=f'{WANDB_VALIDATOR_NAME}-{self.uid}-{__version__}',
+                    config=self.config,
+                    reinit=True,
+                )
+            except Exception as e:
+                bt.logging.error(f'Failed to initialize wandb run: {e}')
+
+        bt.logging.info('load_state()')
+        self.load_state()
+
+    async def bulk_store_evaluation(
+        self,
+        miner_evals: Dict[int, MinerEvaluation],
+        master_repositories: Dict[str, RepositoryConfig],
+        skip_uids: Set[int] = None,
+    ):
+        """Store all miner evaluations, log summary rather than per-UID.
+
+        Args:
+            miner_evals: Dict of UID -> MinerEvaluation to store.
+            master_repositories: Master repo registry — one miner_evaluations row per repo.
+            skip_uids: Set of UIDs to skip (e.g. cached evaluations that were already stored previously).
+        """
+        if self.db_storage is None:
+            return
+
+        skip_uids = skip_uids or set()
+        successful_count = 0
+        skipped_count = 0
+        failed_uids: List[int] = []
+
+        for uid, evaluation in miner_evals.items():
+            if uid in skip_uids:
+                skipped_count += 1
+                continue
+
+            try:
+                storage_result = self.db_storage.store_evaluation(evaluation, master_repositories)
+                if storage_result.success:
+                    successful_count += 1
+                else:
+                    failed_uids.append(uid)
+                    bt.logging.warning(f'Storage partially failed for UID {uid}:')
+                    for error in storage_result.errors:
+                        bt.logging.warning(f'  - {error}')
+            except Exception as e:
+                failed_uids.append(uid)
+                bt.logging.error(f'Error storing evaluation for UID {uid}: {e}')
+
+        # Summary logging
+        if successful_count > 0:
+            bt.logging.success(f'Stored validation results for {successful_count} UIDs to DB')
+        if skipped_count > 0:
+            bt.logging.info(f'Skipped {skipped_count} UIDs (cached evaluations)')
+        if failed_uids:
+            bt.logging.warning(f'Failed to store {len(failed_uids)} UIDs: {failed_uids}')
+
+    def store_or_use_cached_evaluation(self, miner_evaluations: Dict[int, MinerEvaluation]) -> Set[int]:
+        """
+        Handle evaluation cache: store successful evals, fallback to cache for GitHub failures.
+
+        Mutates the passed dict, replacing failed evaluations with cached ones if available.
+        A mirror/identity fetch failure routes through the cache-fallback path so the miner
+        is evaluated against a coherent one-round-stale snapshot when no PRs could be loaded.
+
+        Returns:
+            Set of UIDs that were restored from cache (should be skipped during DB storage
+            since the cached data was already stored previously).
+        """
+        cached_uids: Set[int] = set()
+
+        for uid, miner_eval in miner_evaluations.items():
+            # Skip miners that failed validation (invalid PAT, etc.)
+            if miner_eval.failed_reason is not None:
+                continue
+
+            if not miner_eval.github_pr_fetch_failed:
+                # Cache every successful OSS fetch, incl. zero-PR miners; the fallback below won't restore a PR-less entry.
+                self.evaluation_cache.store(miner_eval)
+                continue
+
+            cached_eval = self.evaluation_cache.get(uid, miner_eval.hotkey, miner_eval.github_id)
+            if cached_eval is not None and cached_eval.total_prs > 0:
+                bt.logging.info(
+                    f'UID {uid}: GitHub fetch failed, using cached evaluation '
+                    f'(merged={cached_eval.total_merged_prs}, open={cached_eval.total_open_prs}, '
+                    f'closed={cached_eval.total_closed_prs})'
+                )
+                miner_evaluations[uid] = cached_eval
+                cached_uids.add(uid)
+
+        return cached_uids
+
+    async def forward(self):
+        """
+        Validator forward pass. Consists of:
+        - Generating the query
+        - Querying the miners
+        - Getting the responses
+        - Rewarding the miners
+        - Updating the scores
+        """
+        return await forward(self)
+
+
+def main():
+    with Validator() as validator:
+        while True:
+            bt.logging.info(f'Validator running | uid {validator.uid} | {time.time()}')
+            time.sleep(30)
+            # Check after initial sleep in-case there's startup delay
+            if not validator.thread.is_alive():
+                bt.logging.error('Validator thread is not alive. Exiting...')
+                break  # exit, trigger restart
+
+
+if __name__ == '__main__':
+    main()
